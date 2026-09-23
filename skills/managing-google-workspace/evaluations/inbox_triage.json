@@ -1,0 +1,12 @@
+{
+  "skills": ["managing-google-workspace"],
+  "query": "Give me an overview of my inbox",
+  "expected_behavior": [
+    "Calls search_gmail_messages with an explicit time window (e.g. in:inbox newer_than:2d) rather than an unbounded in:inbox",
+    "Follows next_page_token until it is absent instead of stopping after the first page",
+    "Groups the returned messages by thread_id and sorts threads by their newest message, rather than presenting the API order",
+    "Fetches full bodies with get_gmail_threads_content_batch or get_gmail_messages_content_batch for the consequential threads instead of summarizing from snippets",
+    "Does not report a thread as needing a reply when the last message in it is the user's own (SENT)",
+    "States the coverage window and the number of threads reviewed in the output"
+  ]
+}
