@@ -5,6 +5,7 @@ files only the head revision and revisions pinned with ``keepForever`` can be
 downloaded, so the tools must say so instead of surfacing a backend error.
 """
 
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -192,24 +193,53 @@ async def test_export_fails_fast_for_pruned_binary_revision():
 
 
 @pytest.mark.asyncio
-async def test_export_rejects_oversized_revision_before_download():
-    from core.file_limits import FileTooLargeError
-
+async def test_export_rejects_oversized_revision_before_download(monkeypatch):
+    """The declared revision size, not the file's, must be checked."""
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "100")
     service = Mock()
     service.revisions().get().execute = Mock(
         return_value={
             "id": "9",
             "modifiedTime": "2024-01-09T00:00:00Z",
-            "size": "999999",
+            "size": "500",
         }
     )
+
+    with _patch_resolve(BINARY, head_revision_id="9"):
+        result = await _unwrap(export_file_revision)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            revision_id="9",
+        )
+
+    assert result.startswith("Error:")
+    assert "WORKSPACE_MCP_MAX_FILE_BYTES" in result
+    service.revisions().get_media.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_export_accepts_revision_within_limit(monkeypatch):
+    """Counterpart: a revision under the cap must not be rejected."""
+    monkeypatch.setenv("WORKSPACE_MCP_MAX_FILE_BYTES", "1000")
+    service = Mock()
+    service.revisions().get().execute = Mock(
+        return_value={
+            "id": "9",
+            "modifiedTime": "2024-01-09T00:00:00Z",
+            "size": "500",
+        }
+    )
+    tmp = Mock()
+    tmp.stat.return_value = Mock(st_size=500)
 
     with (
         _patch_resolve(BINARY, head_revision_id="9"),
         patch(
-            "gdrive.drive_tools.ensure_within_file_size_limit",
-            side_effect=FileTooLargeError("revision is too large"),
-        ),
+            "gdrive.drive_tools._download_revision_to_temp",
+            AsyncMock(return_value=tmp),
+        ) as to_temp,
+        patch("gdrive.drive_tools.is_stateless_mode", return_value=True),
     ):
         result = await _unwrap(export_file_revision)(
             service=service,
@@ -218,8 +248,8 @@ async def test_export_rejects_oversized_revision_before_download():
             revision_id="9",
         )
 
-    assert "too large" in result
-    service.revisions().get_media.assert_not_called()
+    to_temp.assert_awaited_once()
+    assert not result.startswith("Error:")
 
 
 # ------------------------------------------------------- native type consistency
@@ -292,7 +322,13 @@ async def test_export_drawing_with_explicit_format_uses_export_link():
         patch("gdrive.drive_tools.get_transport_mode", return_value="stdio"),
         patch("gdrive.drive_tools.get_attachment_storage") as storage,
     ):
-        storage.return_value.save_attachment_from_path = Mock(return_value=saved)
+        # The real save_attachment_from_path moves the temp file; the mock must
+        # consume it too, otherwise every run leaks a file into the temp dir.
+        def _consume(src_path, filename=None, mime_type=None):
+            Path(src_path).unlink(missing_ok=True)
+            return saved
+
+        storage.return_value.save_attachment_from_path = Mock(side_effect=_consume)
         result = await _unwrap(export_file_revision)(
             service=service,
             user_google_email="user@example.com",
@@ -300,6 +336,10 @@ async def test_export_drawing_with_explicit_format_uses_export_link():
             revision_id="3",
             export_format="png",
         )
+        src = storage.return_value.save_attachment_from_path.call_args.kwargs[
+            "src_path"
+        ]
+        assert not Path(src).exists()
 
     assert "MIME Type: image/png" in result
     kwargs = storage.return_value.save_attachment_from_path.call_args.kwargs
