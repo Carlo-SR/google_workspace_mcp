@@ -85,6 +85,8 @@ For server options, transport, auth modes, tool filtering, and deployment: [refe
 
 For parameters: [references/gmail.md](references/gmail.md)
 
+Summarising or triaging an inbox has a non-obvious failure mode that silently drops the most important messages. Read [references/gmail-inbox-triage.md](references/gmail-inbox-triage.md) before answering "what came in", "what needs a reply" or "summarise my inbox".
+
 ### Google Drive
 
 | Task | Tool |
@@ -266,6 +268,15 @@ For parameters: [references/search.md](references/search.md)
 Parameters: `user_google_email` (string, optional), `service_name` (string, required -- e.g. `"gmail"`, `"drive"`). Legacy OAuth 2.0 only -- disabled when OAuth 2.1 is enabled. In most cases, just call the tool you need and auth happens automatically.
 
 ## Common Workflows
+
+### Summarise the inbox
+1. `search_gmail_messages` with an explicit window (`in:inbox newer_than:2d`) -- message-level, newest first
+2. Follow `next_page_token` to exhaustion -- partial pagination silently drops threads
+3. Group results by `thread_id`, sort threads by their newest message
+4. `get_gmail_threads_content_batch` -- read the bodies that matter, snippets truncate before the deadlines
+5. Skip threads whose last message is the user's own (`SENT`); check drafts before calling anything unanswered
+
+Do not triage from the first page of a thread listing. See [references/gmail-inbox-triage.md](references/gmail-inbox-triage.md).
 
 ### Reply to an email
 1. `search_gmail_messages` -- find the email

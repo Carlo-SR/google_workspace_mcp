@@ -3,6 +3,7 @@
 MCP tools for Gmail message search, sending, drafting, labels, and filters. All tools require `user_google_email` (string, required).
 
 ## Contents
+- Inbox triage (read first for summarising/prioritising): [gmail-inbox-triage.md](gmail-inbox-triage.md)
 - Search & Read: search_gmail_messages, get_gmail_message_content, get_gmail_messages_content_batch, get_gmail_thread_content, get_gmail_threads_content_batch, get_gmail_attachment_content
 - Send & Draft: send_gmail_message, draft_gmail_message
 - Label Management: list_gmail_labels, manage_gmail_label, modify_gmail_message_labels, batch_modify_gmail_message_labels
@@ -213,6 +214,12 @@ Create or delete a filter.
 ### Pagination
 - `search_gmail_messages` returns a `next_page_token` when more results exist. Pass it as `page_token` in the next call.
 - Unpaginated search results are incomplete -- always check for and follow `next_page_token` when you need full coverage.
+- Never use a reported result-count estimate as a stopping condition. Gmail-backed estimates are computed over the index and routinely differ from the real count by a factor of two or more.
+
+### Inbox Triage
+- For "summarise my inbox", "what came in today", "what needs a reply": search at the **message** level and group by `thread_id` yourself. Message search returns newest first; thread-oriented listings do not.
+- Thread listings sort by the *oldest* message in the thread that matches the query. Without a date filter that is the thread's start date, so a three-week-old thread with a reply from this morning sorts three weeks down. The threads this hides are the long-running ones: negotiations, deadlines, escalations.
+- Full procedure, completeness checklist and measurements: [gmail-inbox-triage.md](gmail-inbox-triage.md)
 
 ### Batch Operations
 - Batch tools (`get_gmail_messages_content_batch`, `get_gmail_threads_content_batch`, `batch_modify_gmail_message_labels`) max out at 25 items per call to avoid SSL exhaustion.
