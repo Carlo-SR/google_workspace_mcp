@@ -16,6 +16,8 @@ from urllib.request import url2pathname
 from pathlib import Path
 from weakref import WeakValueDictionary
 
+import httpx
+
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -26,6 +28,7 @@ from auth.oauth_config import is_stateless_mode
 from core.attachment_storage import get_attachment_storage, get_attachment_url
 from core.file_limits import (
     FileTooLargeError,
+    download_http_url_bytes,
     download_media_bytes,
     ensure_within_file_size_limit,
 )
@@ -3017,6 +3020,38 @@ async def set_drive_file_permissions(
     return "\n".join(output_parts)
 
 
+# Export formats accepted by export_file_revision, mapped to their export MIME type.
+REVISION_EXPORT_FORMATS = {
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "csv": "text/csv",
+    "tsv": "text/tab-separated-values",
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "ods": "application/x-vnd.oasis.opendocument.spreadsheet",
+}
+
+
+def revision_is_downloadable(
+    revision: Dict[str, Any],
+    is_native: bool,
+    head_revision_id: Optional[str],
+) -> bool:
+    """Report whether a Drive revision's content can still be fetched.
+
+    Google-native files (Docs/Sheets/Slides) expose every listed revision
+    through exportLinks. For binary files Drive retains the bytes only of the
+    head revision and of revisions pinned with ``keepForever``; the rest are
+    listed as metadata but ``revisions.get_media`` returns an error for them.
+    """
+    if is_native:
+        return True
+    if revision.get("keepForever"):
+        return True
+    revision_id = revision.get("id")
+    return bool(head_revision_id) and revision_id == head_revision_id
+
+
 @server.tool(
     title="List File Revisions",
     annotations=ToolAnnotations(
@@ -3056,10 +3091,14 @@ async def list_file_revisions(
     )
 
     resolved_file_id, file_metadata = await resolve_drive_item(
-        service, file_id, extra_fields="name"
+        service, file_id, extra_fields="name, mimeType, headRevisionId"
     )
     file_id = resolved_file_id
     file_name = file_metadata.get("name", "Unknown File")
+    is_native = file_metadata.get("mimeType", "").startswith(
+        "application/vnd.google-apps."
+    )
+    head_revision_id = file_metadata.get("headRevisionId")
 
     revisions: List[Dict[str, Any]] = []
     page_token = None
@@ -3070,7 +3109,10 @@ async def list_file_revisions(
                 fileId=file_id,
                 pageSize=200,
                 pageToken=page_token,
-                fields="nextPageToken,revisions(id,modifiedTime,lastModifyingUser(displayName,emailAddress),size)",
+                fields=(
+                    "nextPageToken,revisions(id,modifiedTime,keepForever,size,"
+                    "lastModifyingUser(displayName,emailAddress))"
+                ),
             )
             .execute
         )
@@ -3086,19 +3128,35 @@ async def list_file_revisions(
     shown = revisions[-max_results:] if max_results and max_results > 0 else revisions
 
     lines = [
-        f'Version history for "{file_name}" (ID: {file_id}) — '
-        f"{total} revision(s), showing {len(shown)} (oldest to newest):"
+        f'Version history for "{file_name}" (ID: {file_id}): {total} '
+        f"Drive-visible revision(s), showing {len(shown)} (oldest to newest). "
+        "Drive prunes older revisions, so this is not necessarily the file's "
+        "complete edit history."
     ]
     for rev in shown:
         editor = rev.get("lastModifyingUser") or {}
         who = editor.get("displayName") or editor.get("emailAddress") or "unknown"
-        lines.append(
-            f'- revision {rev.get("id")} | {rev.get("modifiedTime", "?")} | by {who}'
+        marker = (
+            ""
+            if revision_is_downloadable(rev, is_native, head_revision_id)
+            else "  [not downloadable]"
         )
-    lines.append(
-        "\nTip: use export_file_revision(file_id, revision_id=...) to download a "
-        "specific revision (e.g. as xlsx) and inspect its contents/formulas."
-    )
+        lines.append(
+            f"- revision {rev.get('id')} | {rev.get('modifiedTime', '?')} | "
+            f"by {who}{marker}"
+        )
+    if is_native:
+        lines.append(
+            "\nTip: use export_file_revision(file_id, revision_id=...) to download a "
+            "specific revision (e.g. as xlsx) and inspect its contents/formulas."
+        )
+    else:
+        lines.append(
+            "\nTip: use export_file_revision(file_id, revision_id=...) to download a "
+            "revision. For binary files Drive keeps the bytes only of the current "
+            "revision and of revisions pinned with keepForever, so revisions marked "
+            "[not downloadable] cannot be fetched."
+        )
     return "\n".join(lines)
 
 
@@ -3127,8 +3185,12 @@ async def export_file_revision(
     download URL (valid for 1 hour). For Google native files (Sheets/Docs/Slides)
     the revision is exported (Sheets -> xlsx by default, or 'csv'/'pdf'); for other
     files the original bytes of that revision are returned. Useful for recovering
-    how a spreadsheet's formulas looked at an earlier revision — pair it with
+    how a spreadsheet's formulas looked at an earlier revision. Pair it with
     list_file_revisions.
+
+    For binary files Drive keeps the bytes only of the current revision and of
+    revisions pinned with keepForever; requesting any other revision fails with
+    a clear error rather than a backend error.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -3136,6 +3198,7 @@ async def export_file_revision(
         revision_id (str): The revision id (from list_file_revisions). Required.
         export_format (str): Optional export format for Google native files.
             Sheets: 'xlsx' (default), 'csv', 'pdf'. Docs/Slides: 'pdf' (default), 'docx'/'pptx'.
+            An unknown value is rejected instead of silently falling back.
 
     Returns:
         str: Metadata with a local file path (stdio) or a download URL (HTTP).
@@ -3144,12 +3207,22 @@ async def export_file_revision(
         f"[export_file_revision] Invoked. File: '{file_id}', Revision: '{revision_id}'"
     )
 
+    if export_format is not None:
+        export_format = export_format.strip().lower().lstrip(".")
+        if export_format not in REVISION_EXPORT_FORMATS:
+            return (
+                f"Error: unknown export_format '{export_format}'. Supported "
+                f"formats: {', '.join(sorted(REVISION_EXPORT_FORMATS))}."
+            )
+
     resolved_file_id, file_metadata = await resolve_drive_item(
-        service, file_id, extra_fields="name, mimeType"
+        service, file_id, extra_fields="name, mimeType, webViewLink, headRevisionId"
     )
     file_id = resolved_file_id
     mime_type = file_metadata.get("mimeType", "")
     file_name = file_metadata.get("name", "Unknown File")
+    web_view_link = file_metadata.get("webViewLink", "#")
+    head_revision_id = file_metadata.get("headRevisionId")
 
     native_defaults = {
         "application/vnd.google-apps.spreadsheet": (
@@ -3159,31 +3232,25 @@ async def export_file_revision(
         "application/vnd.google-apps.document": ("application/pdf", "pdf"),
         "application/vnd.google-apps.presentation": ("application/pdf", "pdf"),
     }
-    fmt_map = {
-        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "csv": "text/csv",
-        "tsv": "text/tab-separated-values",
-        "pdf": "application/pdf",
-        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        "ods": "application/x-vnd.oasis.opendocument.spreadsheet",
-    }
+    is_native = mime_type in native_defaults
 
     revision = await asyncio.to_thread(
         service.revisions()
         .get(
             fileId=file_id,
             revisionId=revision_id,
-            fields="id,modifiedTime,mimeType,exportLinks",
+            fields=(
+                "id,modifiedTime,mimeType,originalFilename,size,keepForever,exportLinks"
+            ),
         )
         .execute
     )
     export_links = revision.get("exportLinks", {}) or {}
 
-    if mime_type in native_defaults:
+    if is_native:
         default_mime, default_ext = native_defaults[mime_type]
-        if export_format and export_format in fmt_map:
-            target_mime, ext = fmt_map[export_format], export_format
+        if export_format:
+            target_mime, ext = REVISION_EXPORT_FORMATS[export_format], export_format
         else:
             target_mime, ext = default_mime, default_ext
         output_filename = f"{Path(file_name).stem}_rev{revision_id}.{ext}"
@@ -3195,30 +3262,68 @@ async def export_file_revision(
                 f"'{ext}'. Available formats: "
                 f"{', '.join(sorted(export_links.keys())) or 'none'}."
             )
-        # Download the per-revision export link via the service's authorized transport
-        resp, content = await asyncio.to_thread(service._http.request, url)
-        status = int(getattr(resp, "status", 0))
-        if status != 200:
+        # Download the per-revision export link with the caller's credentials,
+        # streamed and bounded by WORKSPACE_MCP_MAX_FILE_BYTES.
+        try:
+            access_token = service._http.credentials.token
+            file_content_bytes = await download_http_url_bytes(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+                file_name=file_name,
+                file_id=file_id,
+                web_view_link=web_view_link,
+                kind="revision",
+            )
+        except FileTooLargeError as e:
+            return str(e)
+        except httpx.HTTPStatusError as e:
             return (
                 f"Error: failed to download revision {revision_id} of "
-                f'"{file_name}" (HTTP {status}).'
+                f'"{file_name}" (HTTP {e.response.status_code}).'
             )
-        file_content_bytes = content
         output_mime_type = target_mime
     else:
-        # Binary / uploaded file: download that revision's media directly
+        if not revision_is_downloadable(revision, is_native, head_revision_id):
+            return (
+                f'Revision {revision_id} of "{file_name}" cannot be downloaded. '
+                "Drive keeps the content of a binary file only for its current "
+                "revision and for revisions pinned with keepForever; this "
+                "revision is listed as metadata only. Use list_file_revisions "
+                "to see which revisions are downloadable."
+            )
+
+        # Declared size lets us reject oversized revisions before any transfer.
+        try:
+            ensure_within_file_size_limit(
+                revision.get("size"),
+                file_name=file_name,
+                file_id=file_id,
+                web_view_link=web_view_link,
+                kind="revision",
+            )
+        except FileTooLargeError as e:
+            return str(e)
+
+        # Binary / uploaded file: download that revision's media directly. The
+        # revision carries its own MIME type and filename, which can differ from
+        # the file's current ones after a re-upload.
         request_obj = service.revisions().get_media(
             fileId=file_id, revisionId=revision_id
         )
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request_obj)
-        loop = asyncio.get_event_loop()
-        done = False
-        while not done:
-            _, done = await loop.run_in_executor(None, downloader.next_chunk)
-        file_content_bytes = fh.getvalue()
-        output_mime_type = mime_type
-        stem, suffix = Path(file_name).stem, Path(file_name).suffix
+        try:
+            file_content_bytes = await download_media_bytes(
+                request_obj,
+                file_name=file_name,
+                file_id=file_id,
+                web_view_link=web_view_link,
+                kind="revision",
+            )
+        except FileTooLargeError as e:
+            return str(e)
+
+        output_mime_type = revision.get("mimeType") or mime_type
+        source_name = revision.get("originalFilename") or file_name
+        stem, suffix = Path(source_name).stem, Path(source_name).suffix
         output_filename = f"{stem}_rev{revision_id}{suffix}"
 
     size_bytes = len(file_content_bytes)
@@ -3237,9 +3342,9 @@ async def export_file_revision(
 
     try:
         storage = get_attachment_storage()
-        base64_data = base64.urlsafe_b64encode(file_content_bytes).decode("utf-8")
-        result = storage.save_attachment(
-            base64_data=base64_data,
+        result = await asyncio.to_thread(
+            storage.save_attachment_bytes,
+            file_bytes=file_content_bytes,
             filename=output_filename,
             mime_type=output_mime_type,
         )
