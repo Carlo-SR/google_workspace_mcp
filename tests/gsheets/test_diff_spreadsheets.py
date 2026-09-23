@@ -142,3 +142,32 @@ async def test_diff_counts_cleared_and_added_by_absolute_position():
     assert "- added in B: 1" in result
     assert "A1: only-in-a" in result
     assert "C3: only-in-b" in result
+
+
+@pytest.mark.asyncio
+async def test_diff_reports_value_replaced_by_formula_as_thawed():
+    """A literal replaced by a formula is a formula change, not a literal one."""
+    service = _create_mock_service(
+        {"range": "Sheet1!A1:A1", "values": [["42"]]},
+        {"range": "Sheet1!A1:A1", "values": [["=SUM(B1:B9)"]]},
+    )
+
+    result = await _call_diff(service)
+
+    assert "- thawed (value -> formula in B): 1" in result
+    assert "- changed literals: 0" in result
+    assert "A1: 42 -> =SUM(B1:B9)" in result
+
+
+@pytest.mark.asyncio
+async def test_diff_frozen_and_thawed_are_symmetric():
+    service = _create_mock_service(
+        {"range": "Sheet1!A1:A2", "values": [["=A9"], ["7"]]},
+        {"range": "Sheet1!A1:A2", "values": [["7"], ["=A9"]]},
+    )
+
+    result = await _call_diff(service)
+
+    assert "- frozen (formula -> value in B): 1" in result
+    assert "- thawed (value -> formula in B): 1" in result
+    assert "- changed literals: 0" in result

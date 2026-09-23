@@ -192,45 +192,6 @@ async def test_export_fails_fast_for_pruned_binary_revision():
 
 
 @pytest.mark.asyncio
-async def test_export_uses_revision_mime_type_and_original_filename():
-    service = Mock()
-    service.revisions().get().execute = Mock(
-        return_value={
-            "id": "9",
-            "modifiedTime": "2024-01-09T00:00:00Z",
-            "mimeType": "image/png",
-            "originalFilename": "diagram.png",
-            "size": "12",
-        }
-    )
-    saved = Mock(path="/tmp/diagram_rev9.png", file_id="att-1")
-
-    with (
-        _patch_resolve(BINARY, head_revision_id="9", name="renamed.pdf"),
-        patch(
-            "gdrive.drive_tools.download_media_bytes",
-            AsyncMock(return_value=b"payload"),
-        ),
-        patch("gdrive.drive_tools.is_stateless_mode", return_value=False),
-        patch("gdrive.drive_tools.get_transport_mode", return_value="stdio"),
-        patch("gdrive.drive_tools.get_attachment_storage") as storage,
-    ):
-        storage.return_value.save_attachment_bytes = Mock(return_value=saved)
-        result = await _unwrap(export_file_revision)(
-            service=service,
-            user_google_email="user@example.com",
-            file_id="file-123",
-            revision_id="9",
-        )
-
-    assert "MIME Type: image/png" in result
-    kwargs = storage.return_value.save_attachment_bytes.call_args.kwargs
-    assert kwargs["filename"] == "diagram_rev9.png"
-    assert kwargs["mime_type"] == "image/png"
-    assert kwargs["file_bytes"] == b"payload"
-
-
-@pytest.mark.asyncio
 async def test_export_rejects_oversized_revision_before_download():
     from core.file_limits import FileTooLargeError
 
@@ -259,3 +220,159 @@ async def test_export_rejects_oversized_revision_before_download():
 
     assert "too large" in result
     service.revisions().get_media.assert_not_called()
+
+
+# ------------------------------------------------------- native type consistency
+
+
+@pytest.mark.parametrize(
+    "mime_type,expected",
+    [
+        ("application/vnd.google-apps.spreadsheet", True),
+        ("application/vnd.google-apps.drawing", True),
+        ("application/vnd.google-apps.form", True),
+        ("application/pdf", False),
+        ("", False),
+    ],
+)
+def test_is_native_google_type(mime_type, expected):
+    from gdrive.drive_tools import is_native_google_type
+
+    assert is_native_google_type(mime_type) is expected
+
+
+@pytest.mark.asyncio
+async def test_export_treats_any_workspace_type_as_native():
+    """A Drawing must not fall into the binary path and hit the keepForever error."""
+    service = Mock()
+    service.revisions().get().execute = Mock(
+        return_value={
+            "id": "3",
+            "modifiedTime": "2024-01-03T00:00:00Z",
+            "exportLinks": {"image/png": "https://export.example/png"},
+        }
+    )
+
+    with _patch_resolve(
+        "application/vnd.google-apps.drawing", head_revision_id="9", name="Sketch"
+    ):
+        result = await _unwrap(export_file_revision)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            revision_id="3",
+        )
+
+    # No default export format for Drawings, so it asks instead of failing binary.
+    assert "keepForever" not in result
+    assert "no default export format" in result
+    assert "image/png" in result
+    service.revisions().get_media.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_export_drawing_with_explicit_format_uses_export_link():
+    service = Mock()
+    service.revisions().get().execute = Mock(
+        return_value={
+            "id": "3",
+            "modifiedTime": "2024-01-03T00:00:00Z",
+            "exportLinks": {"image/png": "https://export.example/png"},
+        }
+    )
+    saved = Mock(path="/tmp/Sketch_rev3.png", file_id="att-2")
+
+    with (
+        _patch_resolve("application/vnd.google-apps.drawing", name="Sketch"),
+        patch(
+            "gdrive.drive_tools.download_http_url_bytes",
+            AsyncMock(return_value=b"pngdata"),
+        ),
+        patch("gdrive.drive_tools.is_stateless_mode", return_value=False),
+        patch("gdrive.drive_tools.get_transport_mode", return_value="stdio"),
+        patch("gdrive.drive_tools.get_attachment_storage") as storage,
+    ):
+        storage.return_value.save_attachment_from_path = Mock(return_value=saved)
+        result = await _unwrap(export_file_revision)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            revision_id="3",
+            export_format="png",
+        )
+
+    assert "MIME Type: image/png" in result
+    kwargs = storage.return_value.save_attachment_from_path.call_args.kwargs
+    assert kwargs["filename"] == "Sketch_rev3.png"
+    assert kwargs["mime_type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_export_streams_binary_revision_to_disk():
+    """The binary path must not buffer the whole revision in memory."""
+    service = Mock()
+    service.revisions().get().execute = Mock(
+        return_value={
+            "id": "9",
+            "modifiedTime": "2024-01-09T00:00:00Z",
+            "mimeType": "image/png",
+            "originalFilename": "diagram.png",
+            "size": "12",
+        }
+    )
+    saved = Mock(path="/tmp/diagram_rev9.png", file_id="att-3")
+    tmp = Mock()
+    tmp.stat.return_value = Mock(st_size=7)
+
+    with (
+        _patch_resolve(BINARY, head_revision_id="9", name="renamed.pdf"),
+        patch(
+            "gdrive.drive_tools._download_revision_to_temp",
+            AsyncMock(return_value=tmp),
+        ) as to_temp,
+        patch("gdrive.drive_tools.download_media_bytes") as in_memory,
+        patch("gdrive.drive_tools.is_stateless_mode", return_value=False),
+        patch("gdrive.drive_tools.get_transport_mode", return_value="stdio"),
+        patch("gdrive.drive_tools.get_attachment_storage") as storage,
+    ):
+        storage.return_value.save_attachment_from_path = Mock(return_value=saved)
+        result = await _unwrap(export_file_revision)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            revision_id="9",
+        )
+
+    to_temp.assert_awaited_once()
+    in_memory.assert_not_called()
+    assert "MIME Type: image/png" in result
+    kwargs = storage.return_value.save_attachment_from_path.call_args.kwargs
+    assert kwargs["filename"] == "diagram_rev9.png"
+
+
+@pytest.mark.asyncio
+async def test_export_removes_temp_file_in_stateless_mode():
+    service = Mock()
+    service.revisions().get().execute = Mock(
+        return_value={"id": "9", "modifiedTime": "2024-01-09T00:00:00Z", "size": "12"}
+    )
+    tmp = Mock()
+    tmp.stat.return_value = Mock(st_size=7)
+
+    with (
+        _patch_resolve(BINARY, head_revision_id="9"),
+        patch(
+            "gdrive.drive_tools._download_revision_to_temp",
+            AsyncMock(return_value=tmp),
+        ),
+        patch("gdrive.drive_tools.is_stateless_mode", return_value=True),
+    ):
+        result = await _unwrap(export_file_revision)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            revision_id="9",
+        )
+
+    assert "Stateless mode" in result
+    tmp.unlink.assert_called_once_with(missing_ok=True)

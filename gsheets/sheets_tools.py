@@ -3046,9 +3046,10 @@ async def diff_spreadsheets(
 ) -> str:
     """
     Compares the same sheet between two spreadsheets on the formula level. Reports:
-    frozen (a formula in A became a static value in B), changed formulas, changed
-    literal values, cells cleared in B, and cells added in B. Useful to verify or
-    reverse-engineer a transformation between a master spreadsheet and a derived copy.
+    frozen (a formula in A became a static value in B), thawed (a static value
+    became a formula in B), changed formulas, changed literal values, cells
+    cleared in B, and cells added in B. Useful to verify or reverse-engineer a
+    transformation between a master spreadsheet and a derived copy.
 
     Cells are matched by their absolute sheet coordinates, so an offset range or
     differing leading empty rows/columns in the two spreadsheets do not shift the
@@ -3089,10 +3090,11 @@ async def diff_spreadsheets(
     cells_a = await grab(spreadsheet_id_a)
     cells_b = await grab(spreadsheet_id_b)
 
-    frozen = changed = cleared = added = 0
+    frozen = thawed = changed = cleared = added = 0
     same_formula = same_literal = changed_literal = 0
     examples: Dict[str, List[str]] = {
         "frozen": [],
+        "thawed": [],
         "changed": [],
         "changed literal": [],
         "cleared": [],
@@ -3115,6 +3117,10 @@ async def diff_spreadsheets(
         if a_form and b_has and not b_form:
             frozen += 1
             add_example("frozen", f"{addr}: {str(av)[:40]} -> {str(bv)[:30]}")
+        elif b_form and a_has and not a_form:
+            # The reverse of frozen: a static value became a formula in B.
+            thawed += 1
+            add_example("thawed", f"{addr}: {str(av)[:30]} -> {str(bv)[:40]}")
         elif a_form and b_form:
             if av == bv:
                 same_formula += 1
@@ -3136,13 +3142,21 @@ async def diff_spreadsheets(
     out = [
         f"Diff of sheet '{sheet}' ({'range ' + range_name if range_name else 'whole sheet'}):",
         f"- frozen (formula -> value in B): {frozen}",
+        f"- thawed (value -> formula in B): {thawed}",
         f"- changed formulas: {changed}",
         f"- changed literals: {changed_literal}",
         f"- cleared in B: {cleared}",
         f"- added in B: {added}",
         f"- unchanged formulas: {same_formula} | unchanged literals: {same_literal}",
     ]
-    for label in ("frozen", "changed", "changed literal", "cleared", "added"):
+    for label in (
+        "frozen",
+        "thawed",
+        "changed",
+        "changed literal",
+        "cleared",
+        "added",
+    ):
         if examples[label]:
             out.append(f"\n{label} examples:")
             out.extend(examples[label])

@@ -157,6 +157,50 @@ async def _download_file_to_temp(
     return tmp_path
 
 
+async def _download_revision_to_temp(service, file_id: str, revision_id: str) -> Path:
+    """Stream a Drive revision's media to a temporary file and return its path.
+
+    The revision counterpart to _download_file_to_temp: peak memory is one
+    chunk rather than one copy of the revision, so a large revision cannot
+    exhaust RAM (see #994). The caller owns the returned path and must move or
+    delete it.
+    """
+    tmp_file = NamedTemporaryFile(prefix="wsmcp_rev_", delete=False)
+    tmp_path = Path(tmp_file.name)
+    loop = asyncio.get_event_loop()
+    try:
+        with tmp_file:
+            downloader = MediaIoBaseDownload(
+                tmp_file,
+                service.revisions().get_media(fileId=file_id, revisionId=revision_id),
+                chunksize=DOWNLOAD_CHUNK_SIZE,
+            )
+            done = False
+            while not done:
+                _status, done = await loop.run_in_executor(None, downloader.next_chunk)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
+def _bytes_to_temp(payload: bytes) -> Path:
+    """Write an in-memory payload to a temporary file and return its path.
+
+    Lets the export-link branch share the single disk-backed tail of
+    export_file_revision instead of duplicating the persistence logic.
+    """
+    tmp_file = NamedTemporaryFile(prefix="wsmcp_rev_", delete=False)
+    tmp_path = Path(tmp_file.name)
+    try:
+        with tmp_file:
+            tmp_file.write(payload)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return tmp_path
+
+
 def _splice_content(existing: str, addition: str, mode: str) -> str:
     """Join new text onto existing text, guaranteeing a newline at the seam."""
     head, tail = (existing, addition) if mode == "append" else (addition, existing)
@@ -3029,7 +3073,32 @@ REVISION_EXPORT_FORMATS = {
     "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "ods": "application/x-vnd.oasis.opendocument.spreadsheet",
+    "png": "image/png",
+    "jpeg": "image/jpeg",
+    "svg": "image/svg+xml",
 }
+
+# Default export target per Google Workspace type. Types absent from this map
+# (Drawings, Forms, ...) have no obvious default, so export_format is required.
+NATIVE_EXPORT_DEFAULTS = {
+    "application/vnd.google-apps.spreadsheet": (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xlsx",
+    ),
+    "application/vnd.google-apps.document": ("application/pdf", "pdf"),
+    "application/vnd.google-apps.presentation": ("application/pdf", "pdf"),
+}
+
+
+def is_native_google_type(mime_type: str) -> bool:
+    """Report whether a MIME type is a Google Workspace type.
+
+    Workspace content has no downloadable bytes of its own: every revision is
+    reached through export links instead of revisions.get_media. Both revision
+    tools must agree on this, otherwise the listing advertises revisions the
+    export cannot return.
+    """
+    return bool(mime_type) and mime_type.startswith("application/vnd.google-apps.")
 
 
 def revision_is_downloadable(
@@ -3095,9 +3164,7 @@ async def list_file_revisions(
     )
     file_id = resolved_file_id
     file_name = file_metadata.get("name", "Unknown File")
-    is_native = file_metadata.get("mimeType", "").startswith(
-        "application/vnd.google-apps."
-    )
+    is_native = is_native_google_type(file_metadata.get("mimeType", ""))
     head_revision_id = file_metadata.get("headRevisionId")
 
     revisions: List[Dict[str, Any]] = []
@@ -3182,10 +3249,10 @@ async def export_file_revision(
     Downloads a specific historical revision of a Drive file and saves it.
 
     In stdio mode returns the local file path; in HTTP mode returns a temporary
-    download URL (valid for 1 hour). For Google native files (Sheets/Docs/Slides)
-    the revision is exported (Sheets -> xlsx by default, or 'csv'/'pdf'); for other
-    files the original bytes of that revision are returned. Useful for recovering
-    how a spreadsheet's formulas looked at an earlier revision. Pair it with
+    download URL (valid for 1 hour). Google Workspace files (Sheets/Docs/Slides,
+    Drawings, ...) are exported through the revision's export links; other files
+    return the original bytes of that revision. Useful for recovering how a
+    spreadsheet's formulas looked at an earlier revision. Pair it with
     list_file_revisions.
 
     For binary files Drive keeps the bytes only of the current revision and of
@@ -3196,9 +3263,11 @@ async def export_file_revision(
         user_google_email (str): The user's Google email address. Required.
         file_id (str): The Drive file ID. Required.
         revision_id (str): The revision id (from list_file_revisions). Required.
-        export_format (str): Optional export format for Google native files.
-            Sheets: 'xlsx' (default), 'csv', 'pdf'. Docs/Slides: 'pdf' (default), 'docx'/'pptx'.
-            An unknown value is rejected instead of silently falling back.
+        export_format (str): Optional export format for Google Workspace files.
+            Sheets: 'xlsx' (default), 'csv', 'pdf'. Docs/Slides: 'pdf' (default),
+            'docx'/'pptx'. Workspace types without a default (e.g. Drawings)
+            require this argument. An unknown value is rejected instead of
+            silently falling back.
 
     Returns:
         str: Metadata with a local file path (stdio) or a download URL (HTTP).
@@ -3223,16 +3292,9 @@ async def export_file_revision(
     file_name = file_metadata.get("name", "Unknown File")
     web_view_link = file_metadata.get("webViewLink", "#")
     head_revision_id = file_metadata.get("headRevisionId")
-
-    native_defaults = {
-        "application/vnd.google-apps.spreadsheet": (
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "xlsx",
-        ),
-        "application/vnd.google-apps.document": ("application/pdf", "pdf"),
-        "application/vnd.google-apps.presentation": ("application/pdf", "pdf"),
-    }
-    is_native = mime_type in native_defaults
+    # Must match list_file_revisions, otherwise the two tools disagree about
+    # which revisions can be fetched.
+    is_native = is_native_google_type(mime_type)
 
     revision = await asyncio.to_thread(
         service.revisions()
@@ -3248,11 +3310,19 @@ async def export_file_revision(
     export_links = revision.get("exportLinks", {}) or {}
 
     if is_native:
-        default_mime, default_ext = native_defaults[mime_type]
+        default = NATIVE_EXPORT_DEFAULTS.get(mime_type)
         if export_format:
             target_mime, ext = REVISION_EXPORT_FORMATS[export_format], export_format
+        elif default:
+            target_mime, ext = default
         else:
-            target_mime, ext = default_mime, default_ext
+            available = ", ".join(sorted(export_links.keys())) or "none"
+            return (
+                f'"{file_name}" is a {mime_type} file, which has no default '
+                "export format. Pass export_format explicitly. Supported "
+                f"formats: {', '.join(sorted(REVISION_EXPORT_FORMATS))}. "
+                f"Formats offered for this revision: {available}."
+            )
         output_filename = f"{Path(file_name).stem}_rev{revision_id}.{ext}"
 
         url = export_links.get(target_mime)
@@ -3266,7 +3336,7 @@ async def export_file_revision(
         # streamed and bounded by WORKSPACE_MCP_MAX_FILE_BYTES.
         try:
             access_token = service._http.credentials.token
-            file_content_bytes = await download_http_url_bytes(
+            payload = await download_http_url_bytes(
                 url,
                 headers={"Authorization": f"Bearer {access_token}"},
                 file_name=file_name,
@@ -3282,6 +3352,8 @@ async def export_file_revision(
                 f'"{file_name}" (HTTP {e.response.status_code}).'
             )
         output_mime_type = target_mime
+        tmp_path = await asyncio.to_thread(_bytes_to_temp, payload)
+        del payload
     else:
         if not revision_is_downloadable(revision, is_native, head_revision_id):
             return (
@@ -3304,32 +3376,21 @@ async def export_file_revision(
         except FileTooLargeError as e:
             return str(e)
 
-        # Binary / uploaded file: download that revision's media directly. The
-        # revision carries its own MIME type and filename, which can differ from
-        # the file's current ones after a re-upload.
-        request_obj = service.revisions().get_media(
-            fileId=file_id, revisionId=revision_id
-        )
-        try:
-            file_content_bytes = await download_media_bytes(
-                request_obj,
-                file_name=file_name,
-                file_id=file_id,
-                web_view_link=web_view_link,
-                kind="revision",
-            )
-        except FileTooLargeError as e:
-            return str(e)
-
+        # Binary / uploaded file: stream that revision straight to disk, so peak
+        # memory is one chunk even when no size cap is configured. The revision
+        # carries its own MIME type and filename, which can differ from the
+        # file's current ones after a re-upload.
         output_mime_type = revision.get("mimeType") or mime_type
         source_name = revision.get("originalFilename") or file_name
         stem, suffix = Path(source_name).stem, Path(source_name).suffix
         output_filename = f"{stem}_rev{revision_id}{suffix}"
+        tmp_path = await _download_revision_to_temp(service, file_id, revision_id)
 
-    size_bytes = len(file_content_bytes)
+    size_bytes = tmp_path.stat().st_size
     size_kb = size_bytes / 1024 if size_bytes else 0
 
     if is_stateless_mode():
+        tmp_path.unlink(missing_ok=True)
         return "\n".join(
             [
                 "Revision exported successfully!",
@@ -3343,8 +3404,8 @@ async def export_file_revision(
     try:
         storage = get_attachment_storage()
         result = await asyncio.to_thread(
-            storage.save_attachment_bytes,
-            file_bytes=file_content_bytes,
+            storage.save_attachment_from_path,
+            src_path=str(tmp_path),
             filename=output_filename,
             mime_type=output_mime_type,
         )
@@ -3364,6 +3425,9 @@ async def export_file_revision(
             result_lines.append("\nThe file will expire after 1 hour.")
         return "\n".join(result_lines)
     except Exception as e:
+        # save_attachment_from_path consumes tmp_path on success only; if it
+        # raised before the move completed the temp file is still ours to drop.
+        tmp_path.unlink(missing_ok=True)
         logger.error(f"[export_file_revision] Failed to save file: {e}")
         return (
             f"Error: revision {revision_id} was downloaded ({size_kb:.1f} KB) but "
