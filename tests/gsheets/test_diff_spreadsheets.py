@@ -5,7 +5,7 @@ response to the populated bounding box, so two spreadsheets can return arrays
 whose [0][0] refers to different cells.
 """
 
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -13,7 +13,7 @@ from gsheets.sheets_tools import (
     _a1_address,
     _cells_by_absolute_coordinate,
     _parse_a1_range_origin,
-    diff_spreadsheets,
+    read_sheet_values,
 )
 
 
@@ -34,14 +34,14 @@ def _create_mock_service(response_a, response_b):
     return mock_service
 
 
-async def _call_diff(service, **overrides):
-    return await _unwrap(diff_spreadsheets)(
+async def _call_diff(service, range_name="Sheet1!A1:Z1000"):
+    """The diff is reached through read_sheet_values, not a separate tool."""
+    return await _unwrap(read_sheet_values)(
         service=service,
         user_google_email="user@example.com",
-        spreadsheet_id_a="sheet-a",
-        spreadsheet_id_b="sheet-b",
-        sheet="Sheet1",
-        **overrides,
+        spreadsheet_id="sheet-a",
+        compare_with_spreadsheet_id="sheet-b",
+        range_name=range_name,
     )
 
 
@@ -88,7 +88,7 @@ async def test_diff_uses_absolute_addresses_for_offset_ranges():
         {"range": "Sheet1!B2:B2", "values": [["15"]]},
     )
 
-    result = await _call_diff(service, range_name="B2:B2")
+    result = await _call_diff(service, range_name="Sheet1!B2:B2")
 
     assert "- frozen (formula -> value in B): 1" in result
     assert "B2: =SUM(A1:A5) -> 15" in result
@@ -171,3 +171,113 @@ async def test_diff_frozen_and_thawed_are_symmetric():
     assert "- frozen (formula -> value in B): 1" in result
     assert "- thawed (value -> formula in B): 1" in result
     assert "- changed literals: 0" in result
+
+
+# ------------------------------------------------- no new tools on the surface
+
+
+def _tool_names_in_tiers(section):
+    """Names exposed for a service, per core/tool_tiers.yaml.
+
+    core/tool_registry.py:filter_server_tools prunes anything absent from this
+    file at startup, so the yaml is what actually determines the tool list a
+    client sees. Reading it keeps this test independent of the shared server
+    registry, which other tests in the suite filter in place.
+    """
+    import os
+
+    import yaml
+
+    yaml_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "core", "tool_tiers.yaml"
+    )
+    with open(yaml_path, encoding="utf-8") as fh:
+        config = yaml.safe_load(fh)
+    names = set()
+    for tier in ("core", "extended", "complete"):
+        names.update(config.get(section, {}).get(tier) or [])
+    return names
+
+
+def test_diff_and_audit_add_no_new_tools():
+    """Both must stay parameters of existing tools, not tools of their own."""
+    import inspect
+
+    from gsheets.sheets_tools import get_spreadsheet_info
+
+    exposed = _tool_names_in_tiers("sheets")
+    assert {"read_sheet_values", "get_spreadsheet_info"} <= exposed, (
+        "Detection is broken: the host tools themselves are not listed."
+    )
+    assert "diff_spreadsheets" not in exposed
+    assert "audit_spreadsheet_errors" not in exposed
+
+    assert (
+        "compare_with_spreadsheet_id"
+        in inspect.signature(_unwrap(read_sheet_values)).parameters
+    )
+    assert (
+        "include_error_audit"
+        in inspect.signature(_unwrap(get_spreadsheet_info)).parameters
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_spreadsheet_info_appends_error_audit():
+    from gsheets.sheets_tools import get_spreadsheet_info
+
+    service = Mock()
+    service.spreadsheets().get().execute = Mock(
+        return_value={
+            "spreadsheetId": "sheet-a",
+            "properties": {"title": "Book", "locale": "en_US"},
+            "sheets": [
+                {
+                    "properties": {
+                        "title": "Sheet1",
+                        "sheetId": 0,
+                        "gridProperties": {"rowCount": 10, "columnCount": 5},
+                    }
+                }
+            ],
+        }
+    )
+
+    with patch(
+        "gsheets.sheets_tools._audit_spreadsheet_errors_impl",
+        AsyncMock(return_value="Formula errors: 3 in Sheet1"),
+    ) as audit:
+        result = await _unwrap(get_spreadsheet_info)(
+            service=service,
+            user_google_email="user@example.com",
+            spreadsheet_id="sheet-a",
+            include_error_audit=True,
+        )
+
+    audit.assert_awaited_once()
+    assert "Book" in result
+    assert "Formula errors: 3 in Sheet1" in result
+
+
+@pytest.mark.asyncio
+async def test_get_spreadsheet_info_skips_audit_by_default():
+    from gsheets.sheets_tools import get_spreadsheet_info
+
+    service = Mock()
+    service.spreadsheets().get().execute = Mock(
+        return_value={
+            "spreadsheetId": "sheet-a",
+            "properties": {"title": "Book", "locale": "en_US"},
+            "sheets": [],
+        }
+    )
+
+    with patch("gsheets.sheets_tools._audit_spreadsheet_errors_impl") as audit:
+        result = await _unwrap(get_spreadsheet_info)(
+            service=service,
+            user_google_email="user@example.com",
+            spreadsheet_id="sheet-a",
+        )
+
+    audit.assert_not_called()
+    assert "Book" in result

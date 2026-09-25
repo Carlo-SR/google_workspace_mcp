@@ -65,13 +65,19 @@ Content handling:
 - Other files: downloaded, UTF-8 decoded if possible
 
 ### get_drive_file_download_url
-Download a file to local disk (stdio mode) or get a temporary URL (HTTP mode, valid 1 hour).
+Download a file to local disk (stdio mode) or get a temporary URL (HTTP mode, valid 1 hour). Also serves the file's version history.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | file_id | string | yes | | Drive file ID |
-| export_format | string | no | | `pdf`, `docx`, `xlsx`, `csv`, `pptx` |
+| export_format | string | no | | `pdf`, `docx`, `xlsx`, `csv`, `pptx`; with `revision_id` also `tsv`, `ods`, `png`, `jpeg`, `svg` |
+| list_revisions | boolean | no | false | Return the revision history instead of downloading. Takes precedence over `revision_id` |
+| revision_id | string | no | | Download this historical revision instead of the current file |
+
+**Version history**: call once with `list_revisions=true` to get revision ids, modified times, last editors, and whether each revision's content is still downloadable; then pass one id as `revision_id` to fetch the file as it looked then. Use it to recover how a spreadsheet's formulas were built before an error was introduced.
+
+For Google Workspace files (Docs/Sheets/Slides/Drawings) every listed revision is exportable. For binary files Drive keeps the content only of the current revision and of revisions pinned with `keepForever`; the listing marks the rest `[not downloadable]` and requesting one returns an explanatory error. The revision count is what Drive still exposes, not necessarily the file's complete edit history.
 
 Default export formats for Google native files:
 - Docs: PDF (or `docx`)

@@ -1,5 +1,9 @@
 """Tests for Drive revision listing and per-revision export.
 
+Both reach the user through get_drive_file_download_url: list_revisions=True
+lists the history, revision_id downloads one revision. There is no separate
+revision tool.
+
 Drive lists metadata for revisions whose content it no longer keeps. For binary
 files only the head revision and revisions pinned with ``keepForever`` can be
 downloaded, so the tools must say so instead of surfacing a backend error.
@@ -11,8 +15,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from gdrive.drive_tools import (
-    export_file_revision,
-    list_file_revisions,
+    get_drive_file_download_url,
     revision_is_downloadable,
 )
 
@@ -79,8 +82,11 @@ async def test_list_marks_non_downloadable_binary_revisions():
     )
 
     with _patch_resolve(BINARY, head_revision_id="3"):
-        result = await _unwrap(list_file_revisions)(
-            service=service, user_google_email="user@example.com", file_id="file-123"
+        result = await _unwrap(get_drive_file_download_url)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            list_revisions=True,
         )
 
     assert (
@@ -102,8 +108,11 @@ async def test_list_does_not_mark_native_revisions():
     )
 
     with _patch_resolve(NATIVE_SHEET):
-        result = await _unwrap(list_file_revisions)(
-            service=service, user_google_email="user@example.com", file_id="file-123"
+        result = await _unwrap(get_drive_file_download_url)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            list_revisions=True,
         )
 
     assert "[not downloadable]" not in result
@@ -116,8 +125,11 @@ async def test_list_requests_keep_forever_field():
     service.revisions().list().execute = Mock(return_value={"revisions": []})
 
     with _patch_resolve(BINARY, head_revision_id="1"):
-        await _unwrap(list_file_revisions)(
-            service=service, user_google_email="user@example.com", file_id="file-123"
+        await _unwrap(get_drive_file_download_url)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="file-123",
+            list_revisions=True,
         )
 
     fields = service.revisions().list.call_args.kwargs["fields"]
@@ -132,7 +144,7 @@ async def test_export_rejects_unknown_format():
     service = Mock()
 
     with _patch_resolve(NATIVE_SHEET):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -158,7 +170,7 @@ async def test_export_normalizes_format_case_and_dot():
     )
 
     with _patch_resolve(NATIVE_SHEET):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -179,7 +191,7 @@ async def test_export_fails_fast_for_pruned_binary_revision():
     )
 
     with _patch_resolve(BINARY, head_revision_id="9"):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -206,7 +218,7 @@ async def test_export_rejects_oversized_revision_before_download(monkeypatch):
     )
 
     with _patch_resolve(BINARY, head_revision_id="9"):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -241,7 +253,7 @@ async def test_export_accepts_revision_within_limit(monkeypatch):
         ) as to_temp,
         patch("gdrive.drive_tools.is_stateless_mode", return_value=True),
     ):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -286,7 +298,7 @@ async def test_export_treats_any_workspace_type_as_native():
     with _patch_resolve(
         "application/vnd.google-apps.drawing", head_revision_id="9", name="Sketch"
     ):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -329,7 +341,7 @@ async def test_export_drawing_with_explicit_format_uses_export_link():
             return saved
 
         storage.return_value.save_attachment_from_path = Mock(side_effect=_consume)
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -376,7 +388,7 @@ async def test_export_streams_binary_revision_to_disk():
         patch("gdrive.drive_tools.get_attachment_storage") as storage,
     ):
         storage.return_value.save_attachment_from_path = Mock(return_value=saved)
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -407,7 +419,7 @@ async def test_export_removes_temp_file_in_stateless_mode():
         ),
         patch("gdrive.drive_tools.is_stateless_mode", return_value=True),
     ):
-        result = await _unwrap(export_file_revision)(
+        result = await _unwrap(get_drive_file_download_url)(
             service=service,
             user_google_email="user@example.com",
             file_id="file-123",
@@ -416,3 +428,51 @@ async def test_export_removes_temp_file_in_stateless_mode():
 
     assert "Stateless mode" in result
     tmp.unlink.assert_called_once_with(missing_ok=True)
+
+
+# ------------------------------------------------- no new tools on the surface
+
+
+def _tool_names_in_tiers(section):
+    """Names exposed for a service, per core/tool_tiers.yaml.
+
+    core/tool_registry.py:filter_server_tools prunes anything absent from this
+    file at startup, so the yaml is what actually determines the tool list a
+    client sees. Reading it keeps this test independent of the shared server
+    registry, which other tests in the suite filter in place.
+    """
+    import os
+
+    import yaml
+
+    yaml_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "core", "tool_tiers.yaml"
+    )
+    with open(yaml_path, encoding="utf-8") as fh:
+        config = yaml.safe_load(fh)
+    names = set()
+    for tier in ("core", "extended", "complete"):
+        names.update(config.get(section, {}).get(tier) or [])
+    return names
+
+
+def test_revision_access_adds_no_new_tools():
+    """The maintainer's constraint, as a regression test.
+
+    Revision history and per-revision export must stay reachable through
+    get_drive_file_download_url's parameters. Registering them as tools of their
+    own grows the tool list for every client, including those without dynamic
+    tool discovery.
+    """
+    import inspect
+
+    exposed = _tool_names_in_tiers("drive")
+    assert "get_drive_file_download_url" in exposed, (
+        "Detection is broken: the host tool itself is not listed."
+    )
+    assert "list_file_revisions" not in exposed
+    assert "export_file_revision" not in exposed
+
+    params = inspect.signature(_unwrap(get_drive_file_download_url)).parameters
+    assert "revision_id" in params
+    assert "list_revisions" in params

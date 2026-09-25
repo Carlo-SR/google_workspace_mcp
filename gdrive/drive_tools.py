@@ -532,12 +532,21 @@ async def get_drive_file_download_url(
     user_google_email: str,
     file_id: str,
     export_format: Optional[str] = None,
+    revision_id: Optional[str] = None,
+    list_revisions: bool = False,
 ) -> str:
     """
     Downloads a Google Drive file and saves it to local disk.
 
     In stdio mode, returns the local file path for direct access.
     In HTTP mode, returns a temporary download URL (valid for 1 hour).
+
+    Also serves a file's version history. Set list_revisions=True to list the
+    Drive revisions of the file (id, modified time, last editor, and whether the
+    content is still downloadable), then pass one of those ids as revision_id to
+    download the file as it looked at that point, instead of its current state.
+    Useful for recovering how a spreadsheet's formulas were built before an error
+    was introduced.
 
     For Google native files (Docs, Sheets, Slides), exports to a useful format:
     - Google Docs -> PDF (default) or DOCX if export_format='docx'
@@ -553,13 +562,37 @@ async def get_drive_file_download_url(
                       Options: 'pdf', 'docx', 'xlsx', 'csv', 'pptx'.
                       If not specified, uses sensible defaults (PDF for Docs/Slides, XLSX for Sheets).
                       For Sheets: supports 'csv', 'pdf', or 'xlsx' (default).
+                      With revision_id also 'tsv', 'ods', 'png', 'jpeg', 'svg'.
+        revision_id: Optional Drive revision id (from list_revisions=True). Downloads
+                    that historical revision instead of the current file. For binary
+                    files Drive keeps the content only of the current revision and of
+                    revisions pinned with keepForever; others cannot be fetched.
+        list_revisions: If True, returns the file's revision history instead of
+                       downloading anything. Takes precedence over revision_id.
 
     Returns:
         str: File metadata with either a local file path or download URL.
     """
     logger.info(
-        f"[get_drive_file_download_url] Invoked. File ID: '{file_id}', Export format: {export_format}"
+        f"[get_drive_file_download_url] Invoked. File ID: '{file_id}', "
+        f"Export format: {export_format}, Revision: {revision_id}, "
+        f"List revisions: {list_revisions}"
     )
+
+    if list_revisions:
+        return await _list_file_revisions_impl(
+            service=service,
+            user_google_email=user_google_email,
+            file_id=file_id,
+        )
+    if revision_id:
+        return await _export_file_revision_impl(
+            service=service,
+            user_google_email=user_google_email,
+            file_id=file_id,
+            revision_id=revision_id,
+            export_format=export_format,
+        )
 
     # Resolve shortcuts and get file metadata
     resolved_file_id, file_metadata = await resolve_drive_item(
@@ -3121,18 +3154,7 @@ def revision_is_downloadable(
     return bool(head_revision_id) and revision_id == head_revision_id
 
 
-@server.tool(
-    title="List File Revisions",
-    annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors("list_file_revisions", is_read_only=True, service_type="drive")
-@require_google_service("drive", "drive_read")
-async def list_file_revisions(
+async def _list_file_revisions_impl(
     service,
     user_google_email: str,
     file_id: str,
@@ -3227,18 +3249,7 @@ async def list_file_revisions(
     return "\n".join(lines)
 
 
-@server.tool(
-    title="Export File Revision",
-    annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors("export_file_revision", is_read_only=True, service_type="drive")
-@require_google_service("drive", "drive_read")
-async def export_file_revision(
+async def _export_file_revision_impl(
     service,
     user_google_email: str,
     file_id: str,

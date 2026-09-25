@@ -30,6 +30,7 @@ Get spreadsheet metadata: title, locale, and list of sheets.
 |-----------|------|----------|---------|-------|
 | user_google_email | string | yes | | |
 | spreadsheet_id | string | yes | | |
+| include_error_audit | boolean | no | false | Also scan every sheet for formula error cells (`#REF!`, `#DIV/0!`, `#N/A`, `#VALUE!`, `#NAME?`, `#NUM!`, `#ERROR!`, `#NULL!`) and append per-sheet counts with sample addresses. Reads the full grid of every sheet, so off by default |
 
 ---
 
@@ -52,6 +53,9 @@ Google Sheets can resolve them as named ranges.
 | range_name | string | no | A1:Z1000 | A1 notation, e.g. `Sheet1!A1:D10`. Caps at 1000 rows |
 | include_hyperlinks | boolean | no | false | Fetch hyperlink metadata (slower) |
 | include_notes | boolean | no | false | Fetch cell notes (slower) |
+| compare_with_spreadsheet_id | string | no | | Read `range_name` from this second spreadsheet too and return a formula-level diff instead of the values |
+
+**Comparing two spreadsheets**: with `compare_with_spreadsheet_id`, `spreadsheet_id` is the baseline (A) and the other is the comparison (B). The diff reports formulas that became static values (frozen), values that became formulas (thawed), changed formulas, changed literals, and cells cleared or added in B. Cells are matched by absolute sheet coordinates, so an offset range or differing populated areas do not shift the comparison. Use it to verify or reverse-engineer a transformation between a master spreadsheet and a derived copy.
 
 ### modify_sheet_values
 Write, update, or clear values in a range.

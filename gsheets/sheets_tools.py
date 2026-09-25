@@ -122,6 +122,7 @@ async def get_spreadsheet_info(
     service,
     user_google_email: str,
     spreadsheet_id: str,
+    include_error_audit: bool = False,
 ) -> str:
     """
     Gets information about a specific spreadsheet including its sheets.
@@ -129,6 +130,10 @@ async def get_spreadsheet_info(
     Args:
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id (str): The ID of the spreadsheet to get info for. Required.
+        include_error_audit (bool): If True, also scan every sheet for formula error
+            cells (#REF!, #DIV/0!, #N/A, #VALUE!, #NAME?, #NUM!, #ERROR!, #NULL!) and
+            append per-sheet counts with sample cell addresses. Defaults to False,
+            since the scan reads the full grid of every sheet.
 
     Returns:
         str: Formatted spreadsheet information including title, locale, and sheets list.
@@ -187,6 +192,14 @@ async def get_spreadsheet_info(
         ]
     )
 
+    if include_error_audit:
+        audit = await _audit_spreadsheet_errors_impl(
+            service=service,
+            user_google_email=user_google_email,
+            spreadsheet_id=spreadsheet_id,
+        )
+        text_output = f"{text_output}\n\n{audit}"
+
     logger.info(
         f"Successfully retrieved info for spreadsheet {spreadsheet_id} for {user_google_email}."
     )
@@ -212,9 +225,16 @@ async def read_sheet_values(
     include_hyperlinks: bool = False,
     include_notes: bool = False,
     include_formulas: bool = False,
+    compare_with_spreadsheet_id: Optional[str] = None,
 ) -> str:
     """
     Reads values from a specific range in a Google Sheet.
+
+    With compare_with_spreadsheet_id, returns a formula-level diff of the same
+    range in two spreadsheets instead of the values: formulas that became static
+    values, values that became formulas, changed formulas, changed literals, and
+    cells cleared or added. Useful to verify or reverse-engineer a transformation
+    between a master spreadsheet and a derived copy.
 
     Args:
         user_google_email (str): The user's Google email address. Required.
@@ -229,6 +249,12 @@ async def read_sheet_values(
         include_formulas (bool): If True, also fetch raw formula strings for cells that
             contain formulas. Useful for identifying cross-sheet references before writing
             back to a range. Defaults to False to avoid an extra API request.
+        compare_with_spreadsheet_id (str): Optional second spreadsheet ID. When given,
+            range_name is read from both spreadsheets and a formula-level diff is
+            returned instead of the values. spreadsheet_id is the baseline (A),
+            compare_with_spreadsheet_id the comparison (B). Cells are matched by their
+            absolute sheet coordinates, so differing populated areas do not shift the
+            comparison.
 
     Returns:
         str: The formatted values from the specified range.
@@ -244,6 +270,16 @@ async def read_sheet_values(
             range_name,
             fetch_range,
             MAX_READ_SHEET_ROWS,
+        )
+
+    if compare_with_spreadsheet_id:
+        # Diff the clamped range, so both spreadsheets are bounded the same way.
+        return await _diff_spreadsheets_impl(
+            service=service,
+            user_google_email=user_google_email,
+            spreadsheet_id_a=spreadsheet_id,
+            spreadsheet_id_b=compare_with_spreadsheet_id,
+            full_range=fetch_range,
         )
 
     result = await asyncio.to_thread(
@@ -2871,20 +2907,7 @@ async def manage_named_range(
     )
 
 
-@server.tool(
-    title="Audit Spreadsheet Errors",
-    annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors(
-    "audit_spreadsheet_errors", is_read_only=True, service_type="sheets"
-)
-@require_google_service("sheets", "sheets_read")
-async def audit_spreadsheet_errors(
+async def _audit_spreadsheet_errors_impl(
     service,
     user_google_email: str,
     spreadsheet_id: str,
@@ -2957,6 +2980,10 @@ async def audit_spreadsheet_errors(
     return "\n".join(out)
 
 
+# Examples printed per diff category. Kept as a constant rather than a tool
+# parameter to avoid growing the surface of read_sheet_values.
+DIFF_MAX_EXAMPLES = 6
+
 _A1_CELL_RE = re.compile(r"^\$?([A-Za-z]*)\$?([0-9]*)$")
 
 
@@ -3024,25 +3051,13 @@ def _cells_by_absolute_coordinate(values: List[List], origin: tuple) -> dict:
     return cells
 
 
-@server.tool(
-    title="Diff Spreadsheets",
-    annotations=ToolAnnotations(
-        readOnlyHint=True,
-        destructiveHint=False,
-        idempotentHint=True,
-        openWorldHint=True,
-    ),
-)
-@handle_http_errors("diff_spreadsheets", is_read_only=True, service_type="sheets")
-@require_google_service("sheets", "sheets_read")
-async def diff_spreadsheets(
+async def _diff_spreadsheets_impl(
     service,
     user_google_email: str,
     spreadsheet_id_a: str,
     spreadsheet_id_b: str,
-    sheet: str,
-    range_name: Optional[str] = None,
-    max_examples: int = 6,
+    full_range: str,
+    max_examples: int = DIFF_MAX_EXAMPLES,
 ) -> str:
     """
     Compares the same sheet between two spreadsheets on the formula level. Reports:
@@ -3059,19 +3074,16 @@ async def diff_spreadsheets(
         user_google_email (str): The user's Google email address. Required.
         spreadsheet_id_a (str): First spreadsheet ID (baseline, e.g. master). Required.
         spreadsheet_id_b (str): Second spreadsheet ID (comparison, e.g. export). Required.
-        sheet (str): Sheet/tab name to compare (must exist in both). Required.
-        range_name (str): Optional A1 range to limit the comparison. Defaults to whole sheet.
-        max_examples (int): Max examples per category. Defaults to 6.
+        full_range (str): A1 range read from both spreadsheets, e.g. "Sheet1!A1:D10".
+        max_examples (int): Max examples per category.
 
     Returns:
         str: A summary of the differences with examples.
     """
     logger.info(
-        f"[diff_spreadsheets] Invoked. A: {spreadsheet_id_a}, B: {spreadsheet_id_b}, Sheet: '{sheet}'"
+        f"[diff_spreadsheets] Invoked. A: {spreadsheet_id_a}, B: {spreadsheet_id_b}, "
+        f"Range: '{full_range}'"
     )
-
-    quoted = "'" + sheet.replace("'", "''") + "'"
-    full_range = f"{quoted}!{range_name}" if range_name else quoted
 
     async def grab(sid: str) -> Dict[tuple, Any]:
         result = await asyncio.to_thread(
@@ -3140,7 +3152,8 @@ async def diff_spreadsheets(
             add_example("changed literal", f"{addr}: {str(av)[:34]} -> {str(bv)[:34]}")
 
     out = [
-        f"Diff of sheet '{sheet}' ({'range ' + range_name if range_name else 'whole sheet'}):",
+        f"Formula-level diff of '{full_range}' between {spreadsheet_id_a} (A) "
+        f"and {spreadsheet_id_b} (B):",
         f"- frozen (formula -> value in B): {frozen}",
         f"- thawed (value -> formula in B): {thawed}",
         f"- changed formulas: {changed}",
